@@ -1,0 +1,4 @@
+.helix
+src/pb/*
+!src/pb/mod.rs
+target/
