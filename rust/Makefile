@@ -11,8 +11,10 @@ binary:
 
 
 docker-build:
-#	manifest/make-rules/manifest.sh ${IMAGE_REPO}/edge-proxy:${GIT_VERSION} ${DOCKER_USERNAME} ${DOCKER_PASSWD}
-	docker buildx build --push ${DOCKER_BUILD_ARGS} --platform ${TARGET_PLATFORMS} \
-    --build-arg TARGETOS=linux --build-arg TARGETARCH=amd64 --build-arg GIT_VERSION=${GIT_VERSION} \
-    -f Dockerfile . -t ${IMAGE_REPO}/scaler:${GIT_VERSION}
+	docker  build --platform=linux/amd64 -f Dockerfile -t scaler .
+
+docker-push:
+	export a=$(git show --abbrev-commit --shortstat | head -n1 | awk '{print $NF}')
+	echo $a
+	# docker tag scaler registry.cn-shanghai.aliyuncs.com/scalar_challenge/scaler:$(git show --abbrev-commit --shortstat | head -n1 | awk '{print $NF}') scaler
 

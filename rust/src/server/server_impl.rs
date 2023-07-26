@@ -122,8 +122,17 @@ impl Scaler for ScalerServerImpl {
 impl ScalerServerImpl {
     pub async fn new() -> Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let channel = Channel::from_static("localhost:9000");
-        let platform_client = PlatformClient::connect(channel).await?;
+        let platform_client = loop {
+            info!("connecting to platform...");
+            match PlatformClient::connect("http://127.0.0.1:50051").await {
+                Ok(platform_client) => break platform_client,
+                Err(err) => {
+                    warn!("connecting failed: {err:?}");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        };
+
         Ok(ScalerServerImpl {
             free_slots: Arc::new(Mutex::new(rx)),
             slot_feed: tx.clone(),

@@ -7,7 +7,7 @@ FROM rust:1.71 as builder
 WORKDIR /build
 
 # Copy the source code excluding the 'data' directory
-COPY .. ./
+COPY ./ ./
 RUN cargo build --release && mv target/release/scaler ./ && rm -rf target
 
 # In the second stage, we'll use a small, lightweight base image.
@@ -29,4 +29,3 @@ COPY --from=builder /build /app/source
 # Copy the startup script.
 COPY run.sh run.sh
 RUN chmod +x run.sh
-CMD ./run.sh
