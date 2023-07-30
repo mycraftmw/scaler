@@ -1,12 +1,18 @@
-use tracing::info;
+use tracing::{info, Level};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().init();
-    let addr = "[::1]:9001".parse()?;
+    tracing_subscriber::fmt()
+        .with_ansi(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_max_level(Level::DEBUG)
+        .init();
+    let addr = "127.0.0.1:9001".parse()?;
     let svc = scaler::server::build_server().await?;
-    info!("scaler server starting");
+    info!("scaler service starting");
     tonic::transport::Server::builder()
+        .max_concurrent_streams(1000)
         .add_service(svc)
         .serve(addr)
         .await?;

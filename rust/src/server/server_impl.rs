@@ -28,14 +28,57 @@ impl Scaler for ScalerServerImpl {
         &self,
         request: Request<AssignRequest>,
     ) -> Result<Response<AssignReply>, Status> {
+        info!("receiving assign request");
+        self.assign_impl(request).await.map(|err| {
+            error!("assign has an error: {err:?}");
+            err
+        })
+    }
+
+    #[instrument]
+    async fn idle(&self, request: Request<IdleRequest>) -> Result<Response<IdleReply>, Status> {
+        info!("receiving idle request");
+        self.idle_impl(request).await.map(|err| {
+            error!("idle has an error: {err:?}");
+            err
+        })
+    }
+}
+
+impl ScalerServerImpl {
+    pub async fn new() -> Result<Self> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let platform_client = loop {
+            info!("connecting to platform...");
+            match PlatformClient::connect("http://127.0.0.1:50051").await {
+                Ok(platform_client) => break platform_client,
+                Err(err) => {
+                    warn!("connecting failed: {err:?}");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        };
+        info!("platform connected!");
+        Ok(ScalerServerImpl {
+            free_slots: Arc::new(Mutex::new(rx)),
+            slot_feed: tx.clone(),
+            instances: Arc::new(Mutex::new(HashMap::new())),
+            platform_client: Arc::new(Mutex::new(platform_client)),
+        })
+    }
+
+    async fn assign_impl(
+        &self,
+        request: Request<AssignRequest>,
+    ) -> Result<Response<AssignReply>, Status> {
         let AssignRequest {
             request_id,
-            timestamp,
             meta_data,
+            ..
         } = request.into_inner();
-
         // try queue
         if let Ok(slot) = self.free_slots.lock().await.try_recv() {
+            info!("get one from the queue");
             let instance_id = Uuid::new_v4().to_string();
             self.instances
                 .lock()
@@ -52,7 +95,7 @@ impl Scaler for ScalerServerImpl {
             return Ok(Response::new(AssignReply {
                 status: 0,
                 assigment: Some(assignment),
-                error_message: String::new(),
+                error_message: None,
             }));
         } else {
             // create
@@ -82,18 +125,20 @@ impl Scaler for ScalerServerImpl {
             return Ok(Response::new(AssignReply {
                 status: 0,
                 assigment: Some(assignment),
-                error_message: String::new(),
+                error_message: None,
             }));
         }
         Ok(Response::new(AssignReply {
             status: -1,
             assigment: None,
-            error_message: "busy".to_string(),
+            error_message: Some("busy".to_string()),
         }))
     }
 
-    #[instrument]
-    async fn idle(&self, request: Request<IdleRequest>) -> Result<Response<IdleReply>, Status> {
+    async fn idle_impl(
+        &self,
+        request: Request<IdleRequest>,
+    ) -> Result<Response<IdleReply>, Status> {
         let IdleRequest {
             assigment: assignment,
             result,
@@ -103,7 +148,7 @@ impl Scaler for ScalerServerImpl {
             // if the assignment is valid
             if let Some(slot) = self.instances.lock().await.remove(&assignment.instance_id) {
                 if let Some(result) = result {
-                    if result.need_destroy {
+                    if result.need_destroy() {
                         let request_id = Uuid::new_v4().to_string();
                         let _ = self.destroy_slot(request_id, slot.id, result.reason).await;
                         return Ok(Response::new(IdleReply::default()));
@@ -117,30 +162,6 @@ impl Scaler for ScalerServerImpl {
 
         Ok(Response::new(IdleReply::default()))
     }
-}
-
-impl ScalerServerImpl {
-    pub async fn new() -> Result<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let platform_client = loop {
-            info!("connecting to platform...");
-            match PlatformClient::connect("http://127.0.0.1:50051").await {
-                Ok(platform_client) => break platform_client,
-                Err(err) => {
-                    warn!("connecting failed: {err:?}");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                }
-            }
-        };
-
-        Ok(ScalerServerImpl {
-            free_slots: Arc::new(Mutex::new(rx)),
-            slot_feed: tx.clone(),
-            instances: Arc::new(Mutex::new(HashMap::new())),
-            platform_client: Arc::new(Mutex::new(platform_client)),
-        })
-    }
-
     pub async fn create_slot(
         &self,
         request_id: String,
@@ -167,7 +188,7 @@ impl ScalerServerImpl {
                 {
                     error!("init failed: {e:?}");
                     // if init failed, destroy it
-                    self.destroy_slot(request_id, slot.id, "failed to init".to_string())
+                    self.destroy_slot(request_id, slot.id, Some("failed to init".to_string()))
                         .await?
                 } else {
                     let _ = self.slot_feed.send(slot);
@@ -184,7 +205,7 @@ impl ScalerServerImpl {
         &self,
         request_id: String,
         slot_id: String,
-        reason: String,
+        reason: Option<String>,
     ) -> Result<()> {
         let request = DestroySlotRequest {
             request_id,

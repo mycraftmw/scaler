@@ -8,7 +8,7 @@ WORKDIR /build
 
 # Copy the source code excluding the 'data' directory
 COPY ./ ./
-RUN cargo build --release && mv target/release/scaler ./ && rm -rf target
+RUN cargo build --config cargo_config --release && mv target/release/scaler ./ && rm -rf target
 
 # In the second stage, we'll use a small, lightweight base image.
 FROM registry.cn-beijing.aliyuncs.com/cloudnative-challenge/ubuntu:latest

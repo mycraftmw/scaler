@@ -3,7 +3,7 @@ use crate::{
 };
 use anyhow::Result;
 
-pub mod server_impl;
+mod server_impl;
 
 pub async fn build_server() -> Result<ScalerServer<ScalerServerImpl>> {
     Ok(ScalerServer::new(ScalerServerImpl::new().await?))

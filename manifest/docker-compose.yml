@@ -1,13 +1,10 @@
 version: '3'
 services:
   scaler:
-    image: scaler
+    image: scaler:latest
     command: ["./run.sh"]
-    ports:
-      - "9001:9001"
+    network_mode: "host"
   simulator:
-    image: registry.cn-beijing.aliyuncs.com/cloudnative-challenge/simulator:v1.3.2
-    ports:
-      - "9000:9000"
-      - "50051:50051"
-    command: ./run.sh function_smoke_test
+    image: registry.cn-beijing.aliyuncs.com/cloudnative-challenge/simulator:v1.3.3
+    network_mode: "host"
+    command: function_smoke_test
