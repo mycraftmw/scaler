@@ -8,6 +8,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build_transport(true)
             .compile(&["proto/serverless-sim.proto"], &["proto"])?;
     }
-
     Ok(())
 }

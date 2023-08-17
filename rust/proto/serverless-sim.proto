@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package serverless_simulator;
+package serverless.simulator;
 
 service Scaler {
   rpc Assign(AssignRequest) returns(AssignReply);

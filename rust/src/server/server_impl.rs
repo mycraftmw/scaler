@@ -1,249 +1,176 @@
-use std::{collections::HashMap, sync::Arc};
-
 use anyhow::Result;
-use tokio::sync::{mpsc, Mutex};
-use tonic::{async_trait, transport::Channel, Request, Response, Status};
-use tracing::instrument;
-use tracing::{error, info, warn};
+use tokio::time::Instant;
+use tonic::Status as TonicStatus;
+use tonic::{transport::Channel, Request, Response};
+use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::pb::serverless_simulator::{
-    platform_client::PlatformClient, scaler_server::Scaler, AssignReply, AssignRequest, Assignment,
-    CreateSlotRequest, DestroySlotRequest, IdleReply, IdleRequest, InitRequest, Meta,
-    ResourceConfig, Slot,
+use crate::model::instance::{
+    add_idle_instance, get_idle_instance, remove_from_instance_map, try_add_idle_instance,
+    try_get_idle_instance, update_instance_map,
 };
+use crate::model::meta_data::insert_meta_data;
+use crate::pb::serverless_simulator::Status as ServiceStatus;
+use crate::pb::serverless_simulator::{
+    platform_client::PlatformClient, AssignReply, AssignRequest, Assignment, IdleReply,
+    IdleRequest, Meta, ResourceConfig,
+};
+use crate::platform_client;
 
-#[derive(Debug)]
-pub struct ScalerServerImpl {
-    free_slots: Arc<Mutex<mpsc::UnboundedReceiver<Slot>>>,
-    slot_feed: mpsc::UnboundedSender<Slot>,
-    instances: Arc<Mutex<HashMap<String, Slot>>>,
-    platform_client: Arc<Mutex<PlatformClient<Channel>>>,
-}
-
-#[async_trait]
-impl Scaler for ScalerServerImpl {
-    #[instrument]
-    async fn assign(
-        &self,
-        request: Request<AssignRequest>,
-    ) -> Result<Response<AssignReply>, Status> {
-        info!("receiving assign request");
-        self.assign_impl(request).await.map(|err| {
-            error!("assign has an error: {err:?}");
-            err
-        })
-    }
-
-    #[instrument]
-    async fn idle(&self, request: Request<IdleRequest>) -> Result<Response<IdleReply>, Status> {
-        info!("receiving idle request");
-        self.idle_impl(request).await.map(|err| {
-            error!("idle has an error: {err:?}");
-            err
-        })
-    }
-}
-
-impl ScalerServerImpl {
-    pub async fn new() -> Result<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let platform_client = loop {
-            info!("connecting to platform...");
-            match PlatformClient::connect("http://127.0.0.1:50051").await {
-                Ok(platform_client) => break platform_client,
-                Err(err) => {
-                    warn!("connecting failed: {err:?}");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                }
-            }
-        };
-        info!("platform connected!");
-        Ok(ScalerServerImpl {
-            free_slots: Arc::new(Mutex::new(rx)),
-            slot_feed: tx.clone(),
-            instances: Arc::new(Mutex::new(HashMap::new())),
-            platform_client: Arc::new(Mutex::new(platform_client)),
-        })
-    }
-
-    async fn assign_impl(
-        &self,
-        request: Request<AssignRequest>,
-    ) -> Result<Response<AssignReply>, Status> {
-        let AssignRequest {
-            request_id,
-            meta_data,
-            ..
-        } = request.into_inner();
-        // try queue
-        if let Ok(slot) = self.free_slots.lock().await.try_recv() {
-            info!("get one from the queue");
-            let instance_id = Uuid::new_v4().to_string();
-            self.instances
-                .lock()
-                .await
-                .insert(instance_id.clone(), slot.clone());
-            let mut assignment = Assignment {
-                request_id: request_id.clone(),
-                meta_key: String::new(),
-                instance_id,
-            };
-            if let Some(meta) = meta_data {
-                assignment.meta_key = meta.key.clone();
-            }
-            return Ok(Response::new(AssignReply {
-                status: 0,
-                assigment: Some(assignment),
-                error_message: None,
-            }));
-        } else {
-            // create
-            let resource_config = meta_data.clone().and_then(|meta| {
-                Some(ResourceConfig {
-                    memory_in_megabytes: meta.memory_in_mb,
-                })
-            });
-            info!("try create a slot");
-            let _ = self.create_slot(request_id.clone(), resource_config).await;
-        }
-        // waiting for free slot
-        if let Some(slot) = self.free_slots.lock().await.recv().await {
-            let instance_id = Uuid::new_v4().to_string();
-            self.instances
-                .lock()
-                .await
-                .insert(instance_id.clone(), slot.clone());
-            let mut assignment = Assignment {
-                request_id,
-                meta_key: String::new(),
-                instance_id,
-            };
-            if let Some(meta) = meta_data {
-                assignment.meta_key = meta.key.clone()
-            }
-            return Ok(Response::new(AssignReply {
-                status: 0,
-                assigment: Some(assignment),
-                error_message: None,
-            }));
-        }
-        Ok(Response::new(AssignReply {
-            status: -1,
-            assigment: None,
-            error_message: Some("busy".to_string()),
-        }))
-    }
-
-    async fn idle_impl(
-        &self,
-        request: Request<IdleRequest>,
-    ) -> Result<Response<IdleReply>, Status> {
-        let IdleRequest {
-            assigment: assignment,
-            result,
-        } = request.into_inner();
-
-        if let Some(assignment) = assignment {
-            // if the assignment is valid
-            if let Some(slot) = self.instances.lock().await.remove(&assignment.instance_id) {
-                if let Some(result) = result {
-                    if result.need_destroy() {
-                        let request_id = Uuid::new_v4().to_string();
-                        let _ = self.destroy_slot(request_id, slot.id, result.reason).await;
-                        return Ok(Response::new(IdleReply::default()));
-                    }
-                }
-                // recycling
-                let _ = self.slot_feed.send(slot);
-            }
-            return Ok(Response::new(IdleReply::default()));
-        }
-
-        Ok(Response::new(IdleReply::default()))
-    }
-    pub async fn create_slot(
-        &self,
-        request_id: String,
-        resource_config: Option<ResourceConfig>,
-    ) -> Result<()> {
-        let request = CreateSlotRequest {
+pub async fn assign_impl(
+    platform_client: PlatformClient<Channel>,
+    request: Request<AssignRequest>,
+) -> Result<Response<AssignReply>> {
+    let request_start = Instant::now();
+    let AssignRequest {
+        request_id,
+        meta_data,
+        ..
+    } = request.into_inner();
+    info!("assign request receivied {request_id}");
+    // update the meta data map
+    let meta_data = meta_data.ok_or_else(|| TonicStatus::invalid_argument("no meta data found"))?;
+    insert_meta_data(meta_data.clone()).await;
+    // try from avaliable instance
+    if let Some(instance) = try_get_idle_instance(&meta_data.key).await {
+        update_instance_map(instance.clone()).await;
+        let assignment = Assignment {
             request_id: request_id.clone(),
-            resource_config,
+            meta_key: meta_data.key.clone(),
+            instance_id: instance.instance_id.clone(),
         };
-        let reply = self
-            .platform_client
-            .lock()
-            .await
-            .create_slot(request)
-            .await?
-            .into_inner();
-        match reply.slot {
-            Some(slot) => {
-                info!("slot created");
-                let instance_id = Uuid::new_v4().to_string();
-                if let Err(e) = self
-                    .init_slot(instance_id, None, request_id.clone(), slot.id.clone())
-                    .await
-                {
-                    error!("init failed: {e:?}");
-                    // if init failed, destroy it
-                    self.destroy_slot(request_id, slot.id, Some("failed to init".to_string()))
-                        .await?
-                } else {
-                    let _ = self.slot_feed.send(slot);
-                }
-            }
-            None => {
-                warn!("slot cannot be created, reply:{reply:?}");
+        let reply = AssignReply {
+            status: ServiceStatus::Ok as i32,
+            assigment: Some(assignment),
+            error_message: None,
+        };
+        info!(
+            "assign {instance:?} for request {request_id}, cost {:?}",
+            request_start.elapsed()
+        );
+        return Ok(Response::new(reply));
+    }
+
+    // apply one
+    let request_id_clone = request_id.clone();
+    let meta_data_clone = meta_data.clone();
+    let fut = async move {
+        // todo: retry
+        if let Err(err) =
+            schedule_instance(platform_client, request_id_clone, meta_data_clone).await
+        {
+            error!("failed to schedule an new instance, err:{err}");
+        }
+    };
+    tokio::spawn(fut);
+
+    let instance = get_idle_instance(&meta_data.key).await.map_err(|err| {
+        error!("cannot get available instance, err:{err}");
+        TonicStatus::internal(err.to_string())
+    })?;
+
+    update_instance_map(instance.clone()).await;
+    let assignment = Assignment {
+        request_id: request_id.clone(),
+        meta_key: meta_data.key.clone(),
+        instance_id: instance.instance_id.clone(),
+    };
+    let reply = AssignReply {
+        status: ServiceStatus::Ok as i32,
+        assigment: Some(assignment),
+        error_message: None,
+    };
+    info!(
+        "assign {instance:?} for request {request_id}, cost {:?}",
+        request_start.elapsed()
+    );
+    Ok(Response::new(reply))
+}
+
+async fn schedule_instance(
+    platform_client: PlatformClient<Channel>,
+    request_id: String,
+    meta_data: Meta,
+) -> Result<()> {
+    let resource_config = ResourceConfig {
+        memory_in_megabytes: meta_data.memory_in_mb,
+    };
+    let slot = platform_client::create_slot(
+        platform_client.clone(),
+        request_id.clone(),
+        Some(resource_config),
+    )
+    .await?;
+    let instance_id = Uuid::new_v4().to_string();
+
+    let instance = platform_client::init_slot(
+        platform_client.clone(),
+        request_id.clone(),
+        instance_id,
+        slot,
+        meta_data.clone(),
+    )
+    .await?;
+
+    add_idle_instance(instance.clone()).await?;
+    Ok(())
+}
+
+pub async fn idle_impl(
+    platform_client: PlatformClient<Channel>,
+    request: Request<IdleRequest>,
+) -> Result<Response<IdleReply>> {
+    let request_start = Instant::now();
+    let IdleRequest { assigment, result } = request.into_inner();
+    let assignment =
+        assigment.ok_or_else(|| TonicStatus::invalid_argument("no assignment provided"))?;
+    let Assignment {
+        request_id,
+        instance_id,
+        ..
+    } = assignment;
+    let mut instance = remove_from_instance_map(instance_id.clone())
+        .await
+        .map_err(|err| TonicStatus::invalid_argument(err.to_string()))?;
+    instance.last_idle_time = Instant::now();
+    let need_destroy = result.map(|r| r.need_destroy()).unwrap_or_default();
+    if need_destroy {
+        let _ = platform_client::destroy_slot(
+            platform_client.clone(),
+            request_id.clone(),
+            instance.slot.id.clone(),
+            None,
+        )
+        .await;
+        info!(
+            "idle instance: {instance:?} destroyed, needed, cost: {:?}",
+            request_start.elapsed()
+        );
+    } else {
+        match try_add_idle_instance(instance.clone()).await {
+            Ok(_) => info!(
+                "idle instance: {instance:?} reused, cose: {:?}",
+                request_start.elapsed()
+            ),
+            Err(_) => {
+                // if buffer is full then destory this slot
+                let _ = platform_client::destroy_slot(
+                    platform_client,
+                    request_id,
+                    instance.slot.id.clone(),
+                    None,
+                )
+                .await;
+                info!(
+                    "idle instance: {instance:?} destroyed, buffer is full, cost: {:?}",
+                    request_start.elapsed()
+                )
             }
         }
-        Ok(())
     }
-
-    pub async fn destroy_slot(
-        &self,
-        request_id: String,
-        slot_id: String,
-        reason: Option<String>,
-    ) -> Result<()> {
-        let request = DestroySlotRequest {
-            request_id,
-            id: slot_id,
-            reason,
-        };
-        let reply = self
-            .platform_client
-            .lock()
-            .await
-            .destroy_slot(request)
-            .await?
-            .into_inner();
-        info!("destroy slot: {reply:?}");
-        Ok(())
-    }
-
-    async fn init_slot(
-        &self,
-        instance_id: String,
-        meta_data: Option<Meta>,
-        request_id: String,
-        slot_id: String,
-    ) -> Result<()> {
-        let request = InitRequest {
-            instance_id,
-            meta_data,
-            request_id,
-            slot_id,
-        };
-        let reply = self
-            .platform_client
-            .lock()
-            .await
-            .init(request)
-            .await?
-            .into_inner();
-        info!("init success: {reply:?}");
-        Ok(())
-    }
+    let reply = IdleReply {
+        status: ServiceStatus::Ok as i32,
+        error_message: None,
+    };
+    Ok(Response::new(reply))
 }

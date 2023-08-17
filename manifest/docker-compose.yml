@@ -2,9 +2,14 @@ version: '3'
 services:
   scaler:
     image: scaler:latest
-    command: ["./run.sh"]
     network_mode: "host"
+    command: "./run.sh"
+    environment:
+      - RUST_LOG=info
   simulator:
     image: registry.cn-beijing.aliyuncs.com/cloudnative-challenge/simulator:v1.3.3
     network_mode: "host"
-    command: function_smoke_test
+    command: dataSet_1
+    #command: function_smoke_test 
+    environment:
+      - RUST_LOG=info
